@@ -1,16 +1,240 @@
 ///! Platform host that tests effectful functions writing to stdout and stderr.
 const std = @import("std");
+const builtin = @import("builtin");
 const builtins = @import("builtins");
+
+/// Number of stack frames to capture for leak tracking
+const STACK_TRACE_FRAMES = 8;
+
+/// Allocation info for leak tracking
+const AllocationInfo = struct {
+    stack_trace: [STACK_TRACE_FRAMES]usize,
+    size: usize,
+};
+
+/// Leak-tracking allocator that uses atos for symbolication on macOS
+const LeakTrackingAllocator = struct {
+    allocations: std.AutoHashMap(usize, AllocationInfo),
+    backing_allocator: std.mem.Allocator,
+
+    pub fn init(backing: std.mem.Allocator) LeakTrackingAllocator {
+        return .{
+            .allocations = std.AutoHashMap(usize, AllocationInfo).init(backing),
+            .backing_allocator = backing,
+        };
+    }
+
+    pub fn deinit(self: *LeakTrackingAllocator) void {
+        self.allocations.deinit();
+    }
+
+    pub fn allocator(self: *LeakTrackingAllocator) std.mem.Allocator {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .alloc = alloc,
+                .resize = resize,
+                .remap = remap,
+                .free = free,
+            },
+        };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const self: *LeakTrackingAllocator = @ptrCast(@alignCast(ctx));
+        const result = self.backing_allocator.rawAlloc(len, alignment, ret_addr) orelse return null;
+
+        // Capture stack trace
+        var info = AllocationInfo{
+            .stack_trace = undefined,
+            .size = len,
+        };
+
+        var stack_iter = std.debug.StackIterator.init(ret_addr, null);
+        var i: usize = 0;
+        while (i < STACK_TRACE_FRAMES) : (i += 1) {
+            info.stack_trace[i] = stack_iter.next() orelse 0;
+        }
+
+        self.allocations.put(@intFromPtr(result), info) catch {};
+        return result;
+    }
+
+    fn resize(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const self: *LeakTrackingAllocator = @ptrCast(@alignCast(ctx));
+        return self.backing_allocator.rawResize(buf, alignment, new_len, ret_addr);
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const self: *LeakTrackingAllocator = @ptrCast(@alignCast(ctx));
+        const result = self.backing_allocator.rawRemap(memory, alignment, new_len, ret_addr) orelse return null;
+
+        // Update tracking if pointer changed
+        if (result != memory.ptr) {
+            _ = self.allocations.remove(@intFromPtr(memory.ptr));
+
+            var info = AllocationInfo{
+                .stack_trace = undefined,
+                .size = new_len,
+            };
+            var stack_iter = std.debug.StackIterator.init(ret_addr, null);
+            var i: usize = 0;
+            while (i < STACK_TRACE_FRAMES) : (i += 1) {
+                info.stack_trace[i] = stack_iter.next() orelse 0;
+            }
+            self.allocations.put(@intFromPtr(result), info) catch {};
+        }
+
+        return result;
+    }
+
+    fn free(ctx: *anyopaque, buf: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const self: *LeakTrackingAllocator = @ptrCast(@alignCast(ctx));
+        _ = self.allocations.remove(@intFromPtr(buf.ptr));
+        self.backing_allocator.rawFree(buf, alignment, ret_addr);
+    }
+
+    /// Check for leaks and print stack traces using atos on macOS
+    pub fn checkLeaks(self: *LeakTrackingAllocator) bool {
+        if (self.allocations.count() == 0) {
+            return false; // No leaks
+        }
+
+        const stderr_file: std.fs.File = .stderr();
+        var msg_buf: [256]u8 = undefined;
+        const header = std.fmt.bufPrint(&msg_buf, "\n\x1b[31mMemory leaks detected: {d} allocation(s) not freed\x1b[0m\n\n", .{self.allocations.count()}) catch return true;
+        stderr_file.writeAll(header) catch {};
+
+        var iter = self.allocations.iterator();
+        var leak_num: usize = 1;
+        while (iter.next()) |entry| {
+            const ptr = entry.key_ptr.*;
+            const info = entry.value_ptr.*;
+
+            // Print leak header: "Leak #N: M bytes at 0xPTR\n"
+            const leak_header = std.fmt.bufPrint(&msg_buf, "Leak #{d}: {d} bytes at 0x{x}\n", .{ leak_num, info.size, ptr }) catch continue;
+            stderr_file.writeAll(leak_header) catch {};
+
+            printStackTrace(info.stack_trace[0..], stderr_file);
+            stderr_file.writeAll("\n") catch {};
+            leak_num += 1;
+        }
+
+        return true; // Leaks found
+    }
+};
+
+/// Print stack trace, using atos on macOS for proper symbolication
+fn printStackTrace(addresses: []const usize, file: std.fs.File) void {
+    if (builtin.os.tag == .macos) {
+        printStackTraceWithAtos(addresses, file);
+    } else {
+        // Fallback - just print hex addresses
+        var addr_buf: [64]u8 = undefined;
+        for (addresses) |addr| {
+            if (addr == 0) break;
+            const line = std.fmt.bufPrint(&addr_buf, "    0x{x}\n", .{addr}) catch continue;
+            file.writeAll(line) catch {};
+        }
+    }
+}
+
+/// Use atos to resolve addresses on macOS
+fn printStackTraceWithAtos(addresses: []const usize, file: std.fs.File) void {
+    // Get executable path
+    var path_buf: [std.fs.max_path_bytes:0]u8 = undefined;
+    var path_len: u32 = @intCast(path_buf.len);
+    if (std.c._NSGetExecutablePath(&path_buf, &path_len) != 0) {
+        file.writeAll("    (could not get executable path)\n") catch {};
+        return;
+    }
+    const exe_path = std.mem.sliceTo(&path_buf, 0);
+
+    // Get ASLR slide for main executable
+    const slide = std.c._dyld_get_image_vmaddr_slide(0);
+
+    // Count valid addresses
+    var addr_count: usize = 0;
+    for (addresses) |addr| {
+        if (addr != 0) addr_count += 1;
+    }
+    if (addr_count == 0) return;
+
+    // Build argument slices - store strings in fixed buffers
+    var addr_strings: [STACK_TRACE_FRAMES][24]u8 = undefined;
+    var addr_slices: [STACK_TRACE_FRAMES][]const u8 = undefined;
+    var argv: [STACK_TRACE_FRAMES + 5][]const u8 = undefined;
+    var argc: usize = 0;
+
+    argv[argc] = "atos";
+    argc += 1;
+    argv[argc] = "-o";
+    argc += 1;
+    argv[argc] = exe_path;
+    argc += 1;
+    argv[argc] = "-l";
+    argc += 1;
+
+    // Format load address as 0x...
+    const load_addr = 0x100000000 + @as(usize, @bitCast(slide));
+    var load_addr_buf: [26]u8 = undefined;
+    const load_addr_str = std.fmt.bufPrint(&load_addr_buf, "0x{x}", .{load_addr}) catch "0x0";
+    argv[argc] = load_addr_str;
+    argc += 1;
+
+    // Add addresses
+    for (addresses, 0..) |addr, i| {
+        if (addr == 0) break;
+        const addr_str = std.fmt.bufPrint(&addr_strings[i], "0x{x}", .{addr}) catch continue;
+        addr_slices[i] = addr_str;
+        argv[argc] = addr_slices[i];
+        argc += 1;
+    }
+
+    // Run atos
+    var child = std.process.Child.init(argv[0..argc], std.heap.page_allocator);
+    child.stdout_behavior = .Pipe;
+    child.stderr_behavior = .Pipe;
+
+    child.spawn() catch {
+        // Fallback if atos not available - just print hex addresses
+        var addr_buf: [64]u8 = undefined;
+        for (addresses) |addr| {
+            if (addr == 0) break;
+            const line = std.fmt.bufPrint(&addr_buf, "    0x{x}\n", .{addr}) catch continue;
+            file.writeAll(line) catch {};
+        }
+        return;
+    };
+
+    // Read atos output
+    const stdout = child.stdout orelse return;
+    var output_buf: [4096]u8 = undefined;
+    const bytes_read = stdout.read(&output_buf) catch 0;
+
+    _ = child.wait() catch {};
+
+    if (bytes_read > 0) {
+        // Parse and print each line with indentation
+        var lines = std.mem.splitScalar(u8, output_buf[0..bytes_read], '\n');
+        while (lines.next()) |line| {
+            if (line.len == 0) continue;
+            file.writeAll("    ") catch {};
+            file.writeAll(line) catch {};
+            file.writeAll("\n") catch {};
+        }
+    }
+}
 
 /// Host environment
 const HostEnv = struct {
-    gpa: std.heap.GeneralPurposeAllocator(.{}),
+    leak_tracker: LeakTrackingAllocator,
 };
 
 /// Roc allocation function with size-tracking metadata
 fn rocAllocFn(roc_alloc: *builtins.host_abi.RocAlloc, env: *anyopaque) callconv(.c) void {
     const host: *HostEnv = @ptrCast(@alignCast(env));
-    const allocator = host.gpa.allocator();
+    const allocator = host.leak_tracker.allocator();
 
     const align_enum = std.mem.Alignment.fromByteUnits(@as(usize, @intCast(roc_alloc.alignment)));
 
@@ -42,7 +266,7 @@ fn rocDeallocFn(roc_dealloc: *builtins.host_abi.RocDealloc, env: *anyopaque) cal
     std.log.debug("[DEALLOC] ptr=0x{x} align={d}", .{ @intFromPtr(roc_dealloc.ptr), roc_dealloc.alignment });
 
     const host: *HostEnv = @ptrCast(@alignCast(env));
-    const allocator = host.gpa.allocator();
+    const allocator = host.leak_tracker.allocator();
 
     // Calculate where the size metadata is stored
     const size_storage_bytes = @max(roc_dealloc.alignment, @alignOf(usize));
@@ -66,7 +290,7 @@ fn rocDeallocFn(roc_dealloc: *builtins.host_abi.RocDealloc, env: *anyopaque) cal
 /// Roc reallocation function with size-tracking metadata
 fn rocReallocFn(roc_realloc: *builtins.host_abi.RocRealloc, env: *anyopaque) callconv(.c) void {
     const host: *HostEnv = @ptrCast(@alignCast(env));
-    const allocator = host.gpa.allocator();
+    const allocator = host.leak_tracker.allocator();
 
     // Calculate where the size metadata is stored for the old allocation
     const size_storage_bytes = @max(roc_realloc.alignment, @alignOf(usize));
@@ -251,8 +475,9 @@ const hosted_function_ptrs = [_]builtins.host_abi.HostedFn{
 /// Platform host entrypoint
 fn platform_main(argc: usize, argv: [*][*:0]u8) c_int {
     var host_env = HostEnv{
-        .gpa = std.heap.GeneralPurposeAllocator(.{}){},
+        .leak_tracker = LeakTrackingAllocator.init(std.heap.page_allocator),
     };
+    defer host_env.leak_tracker.deinit();
 
     // Create the RocOps struct
     var roc_ops = builtins.host_abi.RocOps{
@@ -283,9 +508,7 @@ fn platform_main(argc: usize, argv: [*][*:0]u8) c_int {
     std.log.debug("[HOST] Returned from roc, exit_code={d}", .{exit_code});
 
     // Check for memory leaks before returning
-    const leak_status = host_env.gpa.deinit();
-    if (leak_status == .leak) {
-        std.log.err("\x1b[33mMemory leak detected!\x1b[0m", .{});
+    if (host_env.leak_tracker.checkLeaks()) {
         std.process.exit(1);
     }
 
